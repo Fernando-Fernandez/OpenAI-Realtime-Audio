@@ -7,7 +7,7 @@
     body { font-family: sans-serif; padding: 20px; }
     #panels { display: flex; gap: 16px; align-items: flex-start; }
     #log, #events { flex: 1; min-height: 240px; white-space: pre-wrap; background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-y: auto; }
-    #log { background: #f7f7f7; }
+    #log { background: #f7f7f7; max-height: 70vh; }
     #events { background: #eef5ff; font-size: xx-small; max-height: 70vh; }
   </style>
 </head>
@@ -26,7 +26,7 @@
 
 <div id="panels">
   <div style="flex:1">
-    <h2>Transcript</h2>
+    <h2>Responses</h2>
     <div id="log"></div>
   </div>
   <div style="flex:1">
@@ -79,7 +79,10 @@ const QUIET_EVENT_TYPES = new Set([
 ])
 
 function append(text) {
-  document.getElementById("log").textContent += text
+  const pane = document.getElementById("log")
+  if (!pane) return
+  pane.textContent += text
+  pane.scrollTop = pane.scrollHeight
 }
 
 function logEvent(msg) {

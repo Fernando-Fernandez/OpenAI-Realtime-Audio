@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Realtime Audio Communication to LLM</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    #panels { display: flex; gap: 16px; align-items: flex-start; }
+    #log, #events { flex: 1; min-height: 240px; white-space: pre-wrap; background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-y: auto; }
+    #log { background: #f7f7f7; }
+    #events { background: #eef5ff; font-size: xx-small; max-height: 70vh; }
+  </style>
+</head>
+<body>
+
+<h1>Realtime Audio Communication to LLM</h1>
+
+<label>OpenAI API Key</label>
+<input id="token" type="password" style="width: 300px;">
+<button id="start">Start</button>
+<button id="stop">Stop</button>
+
+<div id="panels">
+  <div style="flex:1">
+    <h2>Transcript</h2>
+    <div id="log"></div>
+  </div>
+  <div style="flex:1">
+    <h2>Events</h2>
+    <div id="events"></div>
+    <div id="rate-limit-timers" style="margin-top: 8px; font-size: 0.9em;"></div>
+  </div>
+</div>
+
+<script type="module">
+
+const MIN_REQUEST_INTERVAL_MS = 1500
+const SPEECH_THRESHOLD = 0.02
+const SILENCE_TIMEOUT_MS = 5000
+
+let pc = null
+let dc = null
+let stream = null
+let awaitingResponse = false
+let responseHasText = false
+let currentResponseId = null
+let retryTimer = null
+let sessionReady = false
+let hasRecentSpeech = false
+let lastSpeechTs = 0
+let lastRequestTs = 0
+let audioContext = null
+let analyser = null
+let analyserBuffer = null
+let monitorHandle = null
+const rateLimitBackoffs = {}
+const latestRateLimits = {}
+const conversationItemIds = new Set()
+let transcriptReady = false
+let audioTranscriptBuffer = ""
+let rateLimitTimers = {}
+const QUIET_EVENT_TYPES = new Set([
+  "response.output_text.delta",
+  "response.output_text.done",
+  "response.text.delta",
+  "response.text.done",
+  "response.created",
+  "response.completed",
+  "response.done",
+  "conversation.item.input_audio_transcription.completed",
+  "response.audio_transcript.delta",
+  "response.audio_transcript.done"
+])
+
+function append(text) {
+  document.getElementById("log").textContent += text
+}
+
+function logEvent(msg) {
+  if (!msg || QUIET_EVENT_TYPES.has(msg.type)) return
+  const pane = document.getElementById("events")
+  if (!pane) return
+  const summary = msg.event_id ? `${msg.type} (${msg.event_id})` : msg.type
+  pane.textContent += `${summary}\n${JSON.stringify(msg, null, 2)}\n\n`
+  pane.scrollTop = pane.scrollHeight
+}
+
+function getTextFromDelta(msg) {
+  if (typeof msg.delta === "string") return msg.delta
+  if (msg.delta && Array.isArray(msg.delta.text)) return msg.delta.text.join("")
+  if (typeof msg.delta?.text === "string") return msg.delta.text
+  if (Array.isArray(msg.text)) return msg.text.join("")
+  if (typeof msg.text === "string") return msg.text
+  return ""
+}
+
+function getTranscriptsFromItem(item) {
+  if (!item) return []
+  const transcripts = []
+  if (typeof item.transcript === "string") {
+    transcripts.push(item.transcript)
+  }
+  if (Array.isArray(item.content)) {
+    item.content.forEach(entry => {
+      if (typeof entry?.transcript === "string") {
+        transcripts.push(entry.transcript)
+      } else if (entry?.type === "input_text" && typeof entry.text === "string") {
+        transcripts.push(entry.text)
+      }
+    })
+  }
+  if (item.input_audio_transcription && typeof item.input_audio_transcription.transcript === "string") {
+    transcripts.push(item.input_audio_transcription.transcript)
+  }
+  return transcripts
+}
+
+function rememberConversationItem(id) {
+  if (id) {
+    conversationItemIds.add(id)
+  }
+}
+
+function clearConversationItems() {
+  if (!dc || dc.readyState !== "open" || conversationItemIds.size === 0) return
+  conversationItemIds.forEach(id => {
+    dc.send(JSON.stringify({
+      type: "conversation.item.delete",
+      item_id: id
+    }))
+  })
+  conversationItemIds.clear()
+}
+
+function requestTranscript() {
+  if (!dc || dc.readyState !== "open" || awaitingResponse || currentResponseId || !sessionReady) return
+
+  const now = Date.now()
+  const rateLimitDelay = getRateLimitDelay()
+  if (rateLimitDelay > 0) {
+    scheduleRetry(rateLimitDelay)
+    return
+  }
+
+  if (!hasRecentSpeech || !transcriptReady) {
+    scheduleRetry(400)
+    return
+  }
+
+  const timeSinceLast = now - lastRequestTs
+  if (timeSinceLast < MIN_REQUEST_INTERVAL_MS) {
+    scheduleRetry(MIN_REQUEST_INTERVAL_MS - timeSinceLast)
+    return
+  }
+
+  lastRequestTs = now
+  awaitingResponse = true
+  responseHasText = false
+  transcriptReady = false
+  dc.send(JSON.stringify({
+    type: "response.create",
+    response: {
+      modalities: ["text"],
+      instructions: "Return only the reply to what the user asks. No audio output."
+    }
+  }))
+}
+
+function scheduleRetry(delayMs = 400) {
+  clearTimeout(retryTimer)
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    requestTranscript()
+  }, delayMs)
+}
+
+function finishResponse(success, retryDelayMs = null) {
+  awaitingResponse = false
+  if (success && responseHasText) {
+    append("\n---\n")
+  }
+  responseHasText = false
+  currentResponseId = null
+  audioTranscriptBuffer = ""
+  if (success) {
+    clearConversationItems()
+    hasRecentSpeech = false
+    lastSpeechTs = 0
+    requestTranscript()
+  } else {
+    transcriptReady = true
+    scheduleRetry(retryDelayMs ?? 400)
+  }
+}
+
+function parseRetryDelay(msg) {
+  const message = msg?.response?.status_details?.error?.message || msg.error?.message || ""
+  const clamp = value => Math.max(400, Math.min(value, 5 * 60 * 1000))
+
+  const msMatch = message.match(/([0-9]+(?:\.[0-9]+)?)\s*ms/i)
+  if (msMatch) {
+    return clamp(parseFloat(msMatch[1]))
+  }
+
+  const compactMatch = message.match(/([0-9]+(?:\.[0-9]+)?)m([0-9]+(?:\.[0-9]+)?)s/i)
+  if (compactMatch) {
+    const minutes = parseFloat(compactMatch[1]) || 0
+    const seconds = parseFloat(compactMatch[2]) || 0
+    return clamp((minutes * 60 + seconds) * 1000)
+  }
+
+  const secondsMatch = message.match(/([0-9]+(?:\.[0-9]+)?)\s*s/i)
+  if (secondsMatch) {
+    return clamp(parseFloat(secondsMatch[1]) * 1000)
+  }
+
+  if (/requests per day/i.test(message)) {
+    return clamp(5 * 60 * 1000)
+  }
+
+  return 1000
+}
+
+function noteRateLimitDelay(msg, delayMs) {
+  if (!delayMs) return
+  const limitName =
+    msg?.response?.status_details?.error?.type ||
+    msg?.response?.status_details?.error?.code ||
+    msg?.error?.type ||
+    msg?.error?.code
+  if (!limitName) return
+  const until = Date.now() + delayMs
+  rateLimitBackoffs[limitName] = Math.max(rateLimitBackoffs[limitName] || 0, until)
+}
+
+function getRateLimitDelay() {
+  const now = Date.now()
+  let delay = 0
+  Object.keys(rateLimitBackoffs).forEach(name => {
+    const ts = rateLimitBackoffs[name]
+    if (ts <= now) {
+      delete rateLimitBackoffs[name]
+    } else {
+      delay = Math.max(delay, ts - now)
+    }
+  })
+  return delay
+}
+
+function updateRateLimits(rateLimits) {
+  if (!Array.isArray(rateLimits)) return
+  const now = Date.now()
+  const timersPane = document.getElementById("rate-limit-timers")
+  if (timersPane) timersPane.innerHTML = ""
+  rateLimits.forEach(limit => {
+    if (!limit) return
+    const name = limit.name || limit.type || "default"
+    latestRateLimits[name] = limit
+    const remaining = typeof limit.remaining === "number" ? limit.remaining : null
+    const limitValue = typeof limit.limit === "number" ? limit.limit : null
+    const resetSeconds = typeof limit.reset_seconds === "number" ? Math.max(0, limit.reset_seconds) : 0
+    if (remaining !== null && limitValue !== null) {
+      if (remaining <= 1 && resetSeconds > 0) {
+        const until = now + resetSeconds * 1000
+        rateLimitBackoffs[name] = Math.max(rateLimitBackoffs[name] || 0, until)
+        append(`\n[limit] ${name} exhausted. Waiting ${resetSeconds.toFixed(2)}s\n`)
+      } else if (limitValue > 0 && remaining / limitValue < 0.05) {
+        append(`\n[limit] ${name} low: ${remaining}/${limitValue} (resets in ${resetSeconds.toFixed(2)}s)\n`)
+      }
+    }
+    if (timersPane) {
+      const entry = document.createElement("div")
+      entry.id = `rl-${name}`
+      timersPane.appendChild(entry)
+      rateLimitTimers[name] = {
+        element: entry,
+        resetAt: now + resetSeconds * 1000,
+        name,
+        remaining,
+        limit: limitValue
+      }
+    }
+  })
+  refreshRateLimitTimers()
+}
+
+function refreshRateLimitTimers() {
+  const now = Date.now()
+  Object.keys(rateLimitTimers).forEach(name => {
+    const info = rateLimitTimers[name]
+    if (!info.element) {
+      delete rateLimitTimers[name]
+      return
+    }
+    const timeLeft = Math.max(0, info.resetAt - now)
+    const seconds = (timeLeft / 1000).toFixed(1)
+    const remainingText = info.remaining !== null && info.limit !== null
+      ? `${info.remaining}/${info.limit}`
+      : "n/a"
+    info.element.textContent = `${name}: resets in ${seconds}s (remaining ${remainingText})`
+    if (timeLeft <= 0) {
+      info.element.textContent = `${name}: ready`
+      delete rateLimitTimers[name]
+    }
+  })
+  if (Object.keys(rateLimitTimers).length > 0) {
+    requestAnimationFrame(refreshRateLimitTimers)
+  }
+}
+
+function startAudioMonitor() {
+  if (!stream || audioContext) return
+  audioContext = new AudioContext()
+  const source = audioContext.createMediaStreamSource(stream)
+  analyser = audioContext.createAnalyser()
+  analyser.fftSize = 2048
+  analyserBuffer = new Float32Array(analyser.fftSize)
+  source.connect(analyser)
+
+  const tick = () => {
+    analyser.getFloatTimeDomainData(analyserBuffer)
+    let sum = 0
+    for (let i = 0; i < analyserBuffer.length; i++) {
+      const sample = analyserBuffer[i]
+      sum += sample * sample
+    }
+    const rms = Math.sqrt(sum / analyserBuffer.length)
+    const now = performance.now()
+
+    if (rms > SPEECH_THRESHOLD) {
+      hasRecentSpeech = true
+      lastSpeechTs = now
+      if (!awaitingResponse && !currentResponseId && sessionReady) {
+        scheduleRetry(0)
+      }
+    } else if (hasRecentSpeech && now - lastSpeechTs > SILENCE_TIMEOUT_MS) {
+      hasRecentSpeech = false
+    }
+
+    monitorHandle = requestAnimationFrame(tick)
+  }
+
+  tick()
+}
+
+function stopAudioMonitor() {
+  if (monitorHandle) {
+    cancelAnimationFrame(monitorHandle)
+    monitorHandle = null
+  }
+  if (audioContext) {
+    audioContext.close()
+    audioContext = null
+  }
+  analyser = null
+  analyserBuffer = null
+  hasRecentSpeech = false
+  lastSpeechTs = 0
+}
+
+async function startSession() {
+  const token = document.getElementById("token").value
+  if (!token) {
+    alert("Missing API key")
+    return
+  }
+
+  document.getElementById("log").textContent = ""
+  const eventsPane = document.getElementById("events")
+  if (eventsPane) eventsPane.textContent = ""
+
+  try {
+    // microphone
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    
+    pc = new RTCPeerConnection({
+      bundlePolicy: "max-bundle",
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:global.stun.twilio.com:3478" }
+      ]
+      })
+
+    pc.addTrack(stream.getTracks()[0], stream)
+    startAudioMonitor()
+
+    pc.onconnectionstatechange = () => {
+      if (!pc) return
+      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        append("\n[connection lost]\n")
+      }
+    }
+
+    // data channel for events
+    dc = pc.createDataChannel("oai-events")
+
+    dc.onmessage = evt => {
+      const msg = JSON.parse(evt.data)
+      logEvent(msg)
+
+      if (msg.type === "session.created" || msg.type === "session.updated") {
+        sessionReady = true
+        scheduleRetry(0)
+      } else if (msg.type === "response.created") {
+        currentResponseId = msg.response?.id || msg.response_id || currentResponseId
+      } else if (msg.type === "conversation.item.input_audio_transcription.completed") {
+        rememberConversationItem(msg.item?.id || msg.item_id)
+        const transcripts = []
+        if (typeof msg.transcript === "string") transcripts.push(msg.transcript)
+        transcripts.push(...getTranscriptsFromItem(msg.item))
+        const text = transcripts.join(" ").trim()
+        if (text) {
+          append(`[heard] ${text}\n`)
+          transcriptReady = true
+          scheduleRetry(0)
+        }
+      } else if (
+        msg.type === "response.output_text.delta" ||
+        msg.type === "response.text.delta" ||
+        msg.type === "response.audio_transcript.delta"
+      ) {
+        const deltaText = getTextFromDelta(msg)
+        const audioDelta = msg.type === "response.audio_transcript.delta" ? msg.delta : ""
+        const textToAppend = audioDelta || deltaText
+        if (textToAppend) {
+          responseHasText = true
+          append(textToAppend)
+          if (msg.type === "response.audio_transcript.delta") {
+            audioTranscriptBuffer += textToAppend
+          }
+        }
+      } else if (
+        msg.type === "response.output_text.done" ||
+        msg.type === "response.text.done" ||
+        msg.type === "response.audio_transcript.done"
+      ) {
+        if (msg.type === "response.audio_transcript.done") {
+          const finalText = msg.transcript || ""
+          if (finalText && finalText.trim() === audioTranscriptBuffer.trim()) {
+            append("\n---\n")
+            responseHasText = false
+            audioTranscriptBuffer = ""
+            finishResponse(true)
+            return
+          } else if (finalText) {
+            responseHasText = true
+            append(finalText)
+          }
+        }
+        if (responseHasText) append("\n")
+      } else if (msg.type === "response.completed" || msg.type === "response.done") {
+        if (msg.response_id && currentResponseId && msg.response_id !== currentResponseId) {
+          return
+        }
+        const status = msg.response?.status
+        if (status === "failed" || msg.response?.status_details?.type === "failed") {
+          const errMsg = msg.response?.status_details?.error?.message || "Response failed"
+          append(`\n[error] ${errMsg}\n`)
+          const delay = parseRetryDelay(msg)
+          noteRateLimitDelay(msg, delay)
+          finishResponse(false, delay)
+        } else {
+          finishResponse(true)
+        }
+      } else if (msg.type === "response.failed") {
+        append(`\n[error] ${msg.error?.message || "Response failed"}\n`)
+        const delay = parseRetryDelay(msg)
+        noteRateLimitDelay(msg, delay)
+        finishResponse(false, delay)
+      } else if (msg.type === "error" || msg.type === "response.error") {
+        const errorText = msg.error?.message || evt.data || ""
+        if (errorText.includes("Item with item_id not found")) {
+          return
+        }
+        append(`\n[error] ${errorText}\n`)
+        if (errorText.includes("active response")) {
+          awaitingResponse = true
+          return
+        }
+        const delay = parseRetryDelay(msg)
+        noteRateLimitDelay(msg, delay)
+        finishResponse(false, delay)
+      } else if (msg.type === "rate_limits.updated") {
+        updateRateLimits(msg.rate_limits)
+      }
+    }
+    
+    dc.onopen = () => {
+      awaitingResponse = false
+      sessionReady = false
+      dc.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          instructions: "You are a transcription service. Return only the transcript of what the user says. No audio output.",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 1200
+          }
+        }
+      }))
+    }
+
+    // WebRTC offer + wait for ICE so the API can reach us through NATs
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+
+    await new Promise((resolve, reject) => {
+      if (!pc) return reject(new Error("Peer connection missing"))
+      if (pc.iceGatheringState === "complete") return resolve()
+
+      const checkState = () => {
+        if (!pc) return reject(new Error("Peer connection closed"))
+        if (pc.iceGatheringState === "complete") {
+          pc.removeEventListener("icegatheringstatechange", checkState)
+          return resolve()
+        }
+        if (pc.iceGatheringState === "failed") {
+          pc.removeEventListener("icegatheringstatechange", checkState)
+          return reject(new Error("ICE gathering failed"))
+        }
+      }
+      pc.addEventListener("icegatheringstatechange", checkState)
+      setTimeout(() => {
+        if (!pc) return reject(new Error("Peer connection closed"))
+        pc.removeEventListener("icegatheringstatechange", checkState)
+        reject(new Error("Timed out waiting for ICE"))
+      }, 7000)
+    })
+
+    const resp = await fetch(
+      "https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17&mode=webrtc",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/sdp",
+          "OpenAI-Beta": "realtime=v1"
+        },
+        body: pc.localDescription.sdp
+      }
+    )
+
+    if (!resp.ok) {
+      throw new Error(`Realtime API request failed (${resp.status})`)
+    }
+
+    const answer = await resp.text()
+    await pc.setRemoteDescription({ type: "answer", sdp: answer })
+  } catch (err) {
+    append(`\n[error] ${err.message}\n`)
+    stopSession()
+  }
+}
+
+function stopSession() {
+  if (pc) pc.close()
+  pc = null
+  awaitingResponse = false
+  responseHasText = false
+  currentResponseId = null
+  sessionReady = false
+  hasRecentSpeech = false
+  lastSpeechTs = 0
+  lastRequestTs = 0
+  transcriptReady = false
+  audioTranscriptBuffer = ""
+  clearTimeout(retryTimer)
+  rateLimitTimers = {}
+  conversationItemIds.clear()
+  if (dc) {
+    dc.close()
+    dc = null
+  }
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop())
+    stream = null
+  }
+  stopAudioMonitor()
+}
+
+document.getElementById("start").onclick = startSession
+document.getElementById("stop").onclick = stopSession
+
+</script>
+</body>
+</html>

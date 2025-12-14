@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Realtime Streaming Transcriber</title>
+  <style>
+    :root {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #f5f7fb;
+    }
+    h1 { margin-top: 0; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; }
+    input[type="password"] { width: 360px; max-width: 100%; padding: 8px; }
+    button { margin-right: 8px; padding: 8px 16px; font-size: 14px; }
+    #status { margin-top: 12px; font-size: 14px; color: #333; }
+    #panels { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 24px; }
+    #events { max-height: 50vh; font-size: xx-small; }
+    .panel {
+      flex: 1 1 320px;
+      background: #fff;
+      border-radius: 10px;
+      padding: 16px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.08);
+      min-height: 260px;
+      display: flex;
+      flex-direction: column;
+    }
+    .panel h2 { margin: 0 0 12px; font-size: 16px; }
+    pre {
+      flex: 1;
+      margin: 0;
+      padding: 12px;
+      background: #f0f2f8;
+      border-radius: 8px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Realtime API — Streaming Transcription</h1>
+  <p>
+    This demo implements the "Streaming the transcription of an ongoing audio recording" workflow from the OpenAI docs.
+    Provide an ephemeral API key generated on your backend and click <strong>Start</strong> to stream microphone audio
+    directly to <code>wss://api.openai.com/v1/realtime?intent=transcription</code>.
+  </p>
+
+  <label>OpenAI API Key
+    <input id="token" type="password" autocomplete="off" placeholder="sk-proj-..." />
+  </label>
+  <div>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <div id="status">Idle.</div>
+
+  <div id="panels">
+    <div class="panel">
+      <h2>Transcript</h2>
+      <pre id="transcript"></pre>
+    </div>
+    <div class="panel">
+      <h2>Events</h2>
+      <pre id="events"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    const AUDIO_SAMPLE_RATE = 16000;
+    const WS_BASE = "wss://api.openai.com/v1/realtime?intent=transcription";
+    const SESSION_ENDPOINT = "https://api.openai.com/v1/realtime/transcription_sessions";
+    const SESSION_CONFIG = {
+      input_audio_format: "pcm16",
+      input_audio_transcription: {
+        model: "gpt-4o-transcribe",
+        prompt: "",
+        language: "en"
+      },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 500
+      },
+      input_audio_noise_reduction: {
+        type: "near_field"
+      },
+      include: [
+        "item.input_audio_transcription.logprobs"
+      ]
+    };
+
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const eventsEl = document.getElementById("events");
+
+    let socket = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let workletNode = null;
+    let muteGain = null;
+    let workletUrl = null;
+    let lastCommittedItem = null;
+    let isRunning = false;
+    const transcriptBuffers = new Map();
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function logTranscript(text) {
+      transcriptEl.textContent += text;
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function logEvent(data) {
+      const summary = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+      eventsEl.textContent += summary + "\n\n";
+      eventsEl.scrollTop = eventsEl.scrollHeight;
+    }
+
+    function extractDeltaText(msg) {
+      if (!msg) return "";
+      if (typeof msg.transcript_delta === "string") return msg.transcript_delta;
+      if (typeof msg.delta === "string") return msg.delta;
+      if (Array.isArray(msg.delta?.text)) return msg.delta.text.join("");
+      if (typeof msg.text === "string") return msg.text;
+      const contentDelta = msg.content?.find?.(c => typeof c?.text === "string");
+      if (contentDelta?.text) return contentDelta.text;
+      return "";
+    }
+
+    function extractCompletedTranscript(msg) {
+      if (!msg) return "";
+      if (typeof msg.transcript === "string") return msg.transcript;
+      if (msg.item?.input_audio_transcription?.transcript) {
+        return msg.item.input_audio_transcription.transcript;
+      }
+      const text = msg.item?.content?.find?.(
+        entry => entry?.type === "input_text" && typeof entry.text === "string"
+      )?.text;
+      if (text) return text;
+      if (typeof msg.text === "string") return msg.text;
+      return "";
+    }
+
+    function floatTo16BitPCM(channelData) {
+      const buffer = new ArrayBuffer(channelData.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < channelData.length; i++) {
+        let s = Math.max(-1, Math.min(1, channelData[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buffer;
+    }
+
+    function base64Encode(arrayBuffer) {
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    const PCM_WORKLET = `
+      class PCMWorklet extends AudioWorkletProcessor {
+        process(inputs) {
+          const channelData = inputs?.[0]?.[0];
+          if (channelData) {
+            const clone = new Float32Array(channelData.length);
+            clone.set(channelData);
+            this.port.postMessage(clone, [clone.buffer]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-worklet', PCMWorklet);
+    `;
+
+    async function ensureWorkletLoaded(context) {
+      if (workletUrl) return;
+      const blob = new Blob([PCM_WORKLET], { type: "application/javascript" });
+      workletUrl = URL.createObjectURL(blob);
+      await context.audioWorklet.addModule(workletUrl);
+    }
+
+    async function startAudioStreaming() {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+      await ensureWorkletLoaded(audioContext);
+      const source = audioContext.createMediaStreamSource(mediaStream);
+      workletNode = new AudioWorkletNode(audioContext, "pcm-worklet");
+      muteGain = audioContext.createGain();
+      muteGain.gain.value = 0;
+      workletNode.port.onmessage = event => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        const floatData = event.data;
+        if (!floatData || !floatData.length) return;
+        const pcmBuffer = floatTo16BitPCM(floatData);
+        const base64 = base64Encode(pcmBuffer);
+        socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio: base64 }));
+      };
+      source.connect(workletNode);
+      workletNode.connect(muteGain);
+      muteGain.connect(audioContext.destination);
+    }
+
+    function stopAudioStreaming() {
+      if (workletNode) {
+        workletNode.port.onmessage = null;
+        workletNode.disconnect();
+        workletNode = null;
+      }
+      if (muteGain) {
+        muteGain.disconnect();
+        muteGain = null;
+      }
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      if (workletUrl) {
+        URL.revokeObjectURL(workletUrl);
+        workletUrl = null;
+      }
+    }
+
+    function sendSessionUpdate() {
+      socket.send(JSON.stringify({
+        type: "transcription_session.update",
+        session: { ...SESSION_CONFIG }
+      }));
+    }
+
+    async function createEphemeralSession(apiKey) {
+      const resp = await fetch(SESSION_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "OpenAI-Beta": "realtime=v1"
+        },
+        body: JSON.stringify(SESSION_CONFIG)
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Failed to create transcription session (${resp.status}): ${errText}`);
+      }
+      const data = await resp.json();
+      const clientSecret = data?.client_secret?.value;
+      if (!clientSecret) {
+        throw new Error("Response missing client_secret.value");
+      }
+      return {
+        clientSecret,
+        sessionId: data?.id,
+        websocketUrl: data?.websocket_url || data?.url
+      };
+    }
+
+    function handleMessage(event) {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch (err) {
+        logEvent({ parse_error: err.message, raw: event.data });
+        return;
+      }
+
+      switch (msg.type) {
+        case "transcription_session.created":
+        case "transcription_session.updated":
+          logEvent(msg);
+          break;
+        case "input_audio_buffer.speech_started":
+        case "input_audio_buffer.speech_stopped":
+          logEvent(msg);
+          break;
+        case "input_audio_buffer.committed":
+          if (msg.previous_item_id && msg.previous_item_id !== lastCommittedItem) {
+            logEvent({ warning: "Out-of-order commit", event: msg });
+          }
+          lastCommittedItem = msg.item_id;
+          logEvent(msg);
+          break;
+        case "conversation.item.input_audio_transcription.completed": {
+          logEvent(msg);
+          const transcript = extractCompletedTranscript(msg);
+          const itemId = msg.item_id || msg.item?.id;
+          const buffered = itemId ? transcriptBuffers.get(itemId) : null;
+          if (itemId) transcriptBuffers.delete(itemId);
+          if (transcript) {
+            if (buffered && transcript.trim() === buffered.trim()) {
+              logTranscript("\n---\n");
+            } else {
+              logTranscript(transcript + "\n---\n");
+            }
+          }
+          break;
+        }
+        case "conversation.item.input_audio_transcription.started":
+        case "conversation.item.input_audio_transcription.delta":
+        case "conversation.item.input_audio_transcription.partial": {
+          logEvent(msg);
+          const deltaText = extractDeltaText(msg);
+          if (deltaText) {
+            logTranscript(deltaText);
+            const itemId = msg.item_id || msg.item?.id;
+            if (itemId) {
+              const existing = transcriptBuffers.get(itemId) || "";
+              transcriptBuffers.set(itemId, existing + deltaText);
+            }
+          }
+          break;
+        }
+        case "error":
+          logEvent(msg);
+          break;
+        default:
+          // Surface any other events for visibility
+          logEvent(msg);
+          break;
+      }
+    }
+
+    function resetUI() {
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      isRunning = false;
+      setStatus("Idle.");
+      lastCommittedItem = null;
+      transcriptBuffers.clear();
+    }
+
+    async function startSession() {
+      const apiKey = document.getElementById("token").value.trim();
+      if (!apiKey) {
+        alert("Please provide an OpenAI API key (ephemeral key recommended).");
+        return;
+      }
+      if (isRunning) return;
+
+      transcriptEl.textContent = "";
+      eventsEl.textContent = "";
+      setStatus("Requesting ephemeral token...");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      let ephemeral;
+      try {
+        ephemeral = await createEphemeralSession(apiKey);
+        logEvent({ info: "Ephemeral session created", session_id: ephemeral.sessionId });
+      } catch (err) {
+        logEvent({ error: err.message });
+        resetUI();
+        return;
+      }
+
+      const wsBase = ephemeral.websocketUrl || WS_BASE;
+      const wsQuery = wsBase.includes("session_id")
+        ? wsBase
+        : ephemeral.sessionId
+          ? `${wsBase}${wsBase.includes("?") ? "&" : "?"}session_id=${encodeURIComponent(ephemeral.sessionId)}`
+          : wsBase;
+
+      setStatus("Connecting...");
+      socket = new WebSocket(wsQuery, [
+        "realtime",
+        `openai-insecure-api-key.${ephemeral.clientSecret}`,
+        "openai-beta.realtime-v1"
+      ]);
+
+      socket.addEventListener("open", async () => {
+        try {
+          sendSessionUpdate();
+          await startAudioStreaming();
+          isRunning = true;
+          setStatus("Streaming. Speak to transcribe.");
+          logEvent({ info: "WebSocket open" });
+        } catch (err) {
+          logEvent({ error: err.message });
+          stopSession();
+        }
+      });
+
+      socket.addEventListener("message", handleMessage);
+      socket.addEventListener("error", evt => {
+        logEvent({ error: "WebSocket error", details: evt.message || evt });
+      });
+      socket.addEventListener("close", () => {
+        logEvent({ info: "WebSocket closed" });
+        stopAudioStreaming();
+        resetUI();
+      });
+    }
+
+    function stopSession() {
+      stopAudioStreaming();
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+      socket = null;
+      resetUI();
+    }
+
+    startBtn.addEventListener("click", startSession);
+    stopBtn.addEventListener("click", stopSession);
+  </script>
+</body>
+</html>

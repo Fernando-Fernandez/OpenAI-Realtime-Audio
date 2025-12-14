@@ -19,6 +19,10 @@
 <input id="token" type="password" style="width: 300px;">
 <button id="start">Start</button>
 <button id="stop">Stop</button>
+<label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;">
+  <input type="checkbox" id="enable-audio" checked>
+  Enable audio responses
+</label>
 
 <div id="panels">
   <div style="flex:1">
@@ -37,7 +41,6 @@
 const MIN_REQUEST_INTERVAL_MS = 1500
 const SPEECH_THRESHOLD = 0.02
 const SILENCE_TIMEOUT_MS = 5000
-
 let pc = null
 let dc = null
 let stream = null
@@ -59,6 +62,9 @@ const conversationItemIds = new Set()
 let transcriptReady = false
 let audioTranscriptBuffer = ""
 let rateLimitTimers = {}
+const audioToggle = () => document.getElementById("enable-audio")
+let remoteAudioEl = null
+let remoteStream = null
 const QUIET_EVENT_TYPES = new Set([
   "response.output_text.delta",
   "response.output_text.done",
@@ -132,6 +138,56 @@ function clearConversationItems() {
   conversationItemIds.clear()
 }
 
+function isAudioEnabled() {
+  const toggle = audioToggle()
+  return !!(toggle && toggle.checked)
+}
+
+function ensureRemoteAudioElement() {
+  if (!remoteAudioEl) {
+    remoteAudioEl = document.createElement("audio")
+    remoteAudioEl.autoplay = true
+    remoteAudioEl.style.display = "none"
+    document.body.appendChild(remoteAudioEl)
+  }
+  return remoteAudioEl
+}
+
+function detachRemoteAudio() {
+  if (remoteAudioEl) {
+    remoteAudioEl.srcObject = null
+  }
+}
+
+function attachRemoteAudioIfEnabled() {
+  if (!remoteStream || !isAudioEnabled()) {
+    detachRemoteAudio()
+    return
+  }
+  const audioEl = ensureRemoteAudioElement()
+  audioEl.srcObject = remoteStream
+  audioEl.play().catch(() => {})
+}
+
+function sendAudioPreferenceUpdate() {
+  if (!dc || dc.readyState !== "open") return
+  const audioEnabled = isAudioEnabled()
+  const sessionUpdate = {
+    instructions: audioEnabled
+      ? "You are a voice-enabled assistant. Provide transcripts of the user and respond aloud."
+      : "You are a text-based assistant. Return only the responses to what the user asks. No audio output.",
+    voice: audioEnabled ? "alloy" : "none"
+  }
+  if (audioEnabled) {
+    sessionUpdate.output_audio_format = "pcm16"
+  }
+  dc.send(JSON.stringify({
+    type: "session.update",
+    session: sessionUpdate
+  }))
+  attachRemoteAudioIfEnabled()
+}
+
 function requestTranscript() {
   if (!dc || dc.readyState !== "open" || awaitingResponse || currentResponseId || !sessionReady) return
 
@@ -157,13 +213,24 @@ function requestTranscript() {
   awaitingResponse = true
   responseHasText = false
   transcriptReady = false
-  dc.send(JSON.stringify({
+  const audioEnabled = isAudioEnabled()
+  const responsePayload = {
     type: "response.create",
     response: {
-      modalities: ["text"],
-      instructions: "Repeat the user's question, then answer the question. No audio output."
+      modalities: audioEnabled ? ["text", "audio"] : ["text"],
+      instructions: audioEnabled
+        ? "Repeat the user's question, then answer it concisely. Provide both text and spoken audio."
+        : "Repeat the user's question, then answer the question. No audio output."
     }
-  }))
+  }
+  if (audioEnabled) {
+    responsePayload.response.audio = {
+      voice: "alloy",
+      format: "pcm16",
+      sample_rate: OUTPUT_AUDIO_SAMPLE_RATE
+    }
+  }
+  dc.send(JSON.stringify(responsePayload))
 }
 
 function scheduleRetry(delayMs = 400) {
@@ -381,6 +448,17 @@ async function startSession() {
       ]
       })
 
+    pc.ontrack = event => {
+      remoteStream = event.streams[0]
+      if (isAudioEnabled()) {
+        const audioEl = ensureRemoteAudioElement()
+        audioEl.srcObject = remoteStream
+        audioEl.play().catch(() => {})
+      } else {
+        detachRemoteAudio()
+      }
+    }
+
     pc.addTrack(stream.getTracks()[0], stream)
     startAudioMonitor()
 
@@ -488,19 +566,27 @@ async function startSession() {
     dc.onopen = () => {
       awaitingResponse = false
       sessionReady = false
-      dc.send(JSON.stringify({
-        type: "session.update",
-        session: {
-          instructions: "You are a transcription service. Return only the transcript of what the user says. No audio output.",
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 1200
-          }
-        }
-      }))
+      const audioEnabled = isAudioEnabled()
+    const sessionUpdate = {
+      instructions: audioEnabled
+        ? "You are a voice-enabled assistant. Provide transcripts of the user and respond aloud."
+        : "You are a transcription service. Return only the transcript of what the user says. No audio output.",
+      voice: audioEnabled ? "alloy" : "none",
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 1200
+      }
     }
+    if (audioEnabled) {
+      sessionUpdate.output_audio_format = "pcm16"
+    }
+    dc.send(JSON.stringify({
+      type: "session.update",
+      session: sessionUpdate
+    }))
+  }
 
     // WebRTC offer + wait for ICE so the API can reach us through NATs
     const offer = await pc.createOffer()
@@ -578,10 +664,13 @@ function stopSession() {
     stream = null
   }
   stopAudioMonitor()
+  detachRemoteAudio()
+  remoteStream = null
 }
 
 document.getElementById("start").onclick = startSession
 document.getElementById("stop").onclick = stopSession
+document.getElementById("enable-audio").addEventListener("change", sendAudioPreferenceUpdate)
 
 </script>
 </body>

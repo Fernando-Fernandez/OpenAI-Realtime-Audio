@@ -13,15 +13,16 @@ Implements the workflow from the “Streaming the transcription of an ongoing au
 
 Use this page when you want to replicate the official Realtime transcription flow end-to-end or debug low-level events.
 
-## [`listener.html`](./listener.html) – Legacy WebRTC Listener
+## [`listener.html`](./listener.html) – WebRTC Voice Listener
 
-Earlier prototype that talks to the Realtime API over plain WebRTC SDP instead of the dedicated transcription intent.
+Browser demo for the general-purpose Realtime model over SDP.
 
 - Prompts for your API key, creates an `RTCPeerConnection`, and posts its SDP offer to `https://api.openai.com/v1/realtime?...&mode=webrtc`.
-- Streams the microphone via RTP media tracks and receives text/audio responses over a data channel (`oai-events`).
-- Includes optional turn detection, rate-limit handling, and a transcript log but still relies on the general-purpose Realtime model (e.g., `gpt-4o-realtime-preview`), not the transcription intent.
+- Streams the microphone to the model and receives text events over the `oai-events` data channel (rate-limit tracking, transcript log, etc.).
+- **Voice toggle**: A checkbox lets you enable spoken replies. When on, the app sends a session update with `voice: "alloy"` and plays the model’s RTP audio track via an `<audio autoplay>` element attached to `pc.ontrack`. When off, only text is returned.
+- Uses local VAD + retry logic to avoid hammering rate limits and shows every realtime event in a debug pane.
 
-Use `listener.html` if you’re experimenting with two-way Realtime conversations or need the general-purpose model to synthesize output as well as transcribe input.
+Use `listener.html` if you’re experimenting with two-way conversations or need to hear the model respond in real time while still reading the transcripts.
 
 ---
 

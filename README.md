@@ -25,4 +25,10 @@ Use `listener.html` if you’re experimenting with two-way Realtime conversation
 
 ---
 
-Both pages expect to be served over `https://` or `http://localhost` due to browser media security rules. Neither stores keys; refresh the page between tests if you need to reset state. Adjust the models, VAD settings, or UI as needed for your project.***
+Both pages expect to be served over `https://` or `http://localhost` due to browser media security rules. Neither stores keys; refresh the page between tests if you need to reset state. Adjust the models, VAD settings, or UI as needed for your project.
+
+### Glossary
+
+- **VAD (Voice Activity Detection)** – Logic that detects when speech starts or stops. The server VAD settings (`threshold`, `prefix_padding_ms`, `silence_duration_ms`) tell OpenAI when to commit audio chunks so we only request transcripts while someone is speaking.
+- **PCM16** – Pulse-code modulation with 16-bit signed samples at 16 kHz. This raw `int16` format is what the transcription intent accepts; the AudioWorklet converts browser floats to PCM16 before base64 encoding each chunk.
+- **SDP (Session Description Protocol)** – Text blob describing media capabilities in WebRTC offers/answers. `listener.html` creates an SDP offer for its audio track + data channel, sends it to OpenAI, and receives an SDP answer so the peer connection can exchange RTP packets.***

@@ -2,7 +2,7 @@
 
 This repo contains two self‑contained browser demos for OpenAI’s WebRTC/Realtime stack. Serve the folder locally (e.g., `npx serve .`) so `getUserMedia` works, open each page in Chrome/Edge/Safari, and paste an API key or ephemeral token as indicated.
 
-## `transcriber.html` – Streaming Audio Transcription (Realtime API)
+## [`transcriber.html`](./transcriber.html) – Streaming Audio Transcription (Realtime API)
 
 Implements the workflow from the “Streaming the transcription of an ongoing audio recording” guide.
 
@@ -13,7 +13,7 @@ Implements the workflow from the “Streaming the transcription of an ongoing au
 
 Use this page when you want to replicate the official Realtime transcription flow end-to-end or debug low-level events.
 
-## `listener.html` – Legacy WebRTC Listener
+## [`listener.html`](./listener.html) – Legacy WebRTC Listener
 
 Earlier prototype that talks to the Realtime API over plain WebRTC SDP instead of the dedicated transcription intent.
 

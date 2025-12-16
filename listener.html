@@ -504,10 +504,6 @@ async function startSession() {
     return
   }
 
-  document.getElementById("log").textContent = ""
-  const eventsPane = document.getElementById("events")
-  if (eventsPane) eventsPane.textContent = ""
-
   try {
     // microphone
     stream = await navigator.mediaDevices.getUserMedia({ audio: true })

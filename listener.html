@@ -9,20 +9,48 @@
     #log, #events { flex: 1; min-height: 240px; white-space: pre-wrap; background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-y: auto; }
     #log { background: #f7f7f7; max-height: 70vh; }
     #events { background: #eef5ff; font-size: xx-small; max-height: 70vh; }
+    #session-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    #mic-indicator-wrapper { display: inline-flex; align-items: center; gap: 8px; font-size: 0.9em; color: #444; }
+    #mic-indicator { width: 96px; height: 32px; display: flex; align-items: flex-end; gap: 4px; padding: 6px 8px 4px; border: 1px solid #d0d0d0; border-radius: 6px; background: #fff; transition: border-color 0.15s, box-shadow 0.15s; }
+    #mic-indicator[data-active="true"] { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); }
+    #mic-indicator span { flex: 1; display: block; width: 6px; border-radius: 3px; background: linear-gradient(180deg, #99c2ff, #2563eb); height: 10%; opacity: 0.4; transition: height 0.08s ease-out, opacity 0.1s; }
+    #mic-indicator[data-active="true"] span { opacity: 0.9; }
   </style>
 </head>
 <body>
 
 <h1>Realtime Audio Communication to LLM</h1>
 
-<label>OpenAI API Key</label>
-<input id="token" type="password" style="width: 300px;">
-<button id="start">Start</button>
-<button id="stop">Stop</button>
-<label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;">
-  <input type="checkbox" id="enable-audio" checked>
-  Enable audio responses
-</label>
+<div id="session-controls">
+  <label>OpenAI API Key</label>
+  <input id="token" type="password" style="width: 300px;">
+  <button id="start">Start</button>
+  <button id="stop">Stop</button>
+  <label style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;">
+    <input type="checkbox" id="enable-audio" checked>
+    Enable audio responses
+  </label>
+  <div id="mic-indicator-wrapper">
+    <span>Mic activity</span>
+    <div id="mic-indicator" aria-hidden="true"></div>
+  </div>
+  <label style="display:inline-flex;align-items:center;gap:6px;">
+    Voice
+    <select id="voice-select">
+      <option value="alloy" selected>alloy</option>
+      <option value="ash">ash</option>
+      <option value="ballad">ballad</option>
+      <option value="coral">coral</option>
+      <option value="echo">echo</option>
+      <option value="fable">fable</option>
+      <option value="onyx">onyx</option>
+      <option value="nova">nova</option>
+      <option value="sage">sage</option>
+      <option value="shimmer">shimmer</option>
+      <option value="verse">verse</option>
+    </select>
+  </label>
+</div>
 
 <div id="panels">
   <div style="flex:1">
@@ -41,6 +69,7 @@
 const MIN_REQUEST_INTERVAL_MS = 1500
 const SPEECH_THRESHOLD = 0.02
 const SILENCE_TIMEOUT_MS = 5000
+const MIC_BAR_COUNT = 10
 let pc = null
 let dc = null
 let stream = null
@@ -63,8 +92,10 @@ let transcriptReady = false
 let audioTranscriptBuffer = ""
 let rateLimitTimers = {}
 const audioToggle = () => document.getElementById("enable-audio")
+const voiceSelect = () => document.getElementById("voice-select")
 let remoteAudioEl = null
 let remoteStream = null
+let micIndicatorBars = []
 const QUIET_EVENT_TYPES = new Set([
   "response.output_text.delta",
   "response.output_text.done",
@@ -77,6 +108,41 @@ const QUIET_EVENT_TYPES = new Set([
   "response.audio_transcript.delta",
   "response.audio_transcript.done"
 ])
+
+function initMicIndicator() {
+  const container = document.getElementById("mic-indicator")
+  if (!container) return
+  if (container.childElementCount === 0) {
+    for (let i = 0; i < MIC_BAR_COUNT; i++) {
+      const bar = document.createElement("span")
+      container.appendChild(bar)
+    }
+  }
+  micIndicatorBars = Array.from(container.querySelectorAll("#mic-indicator span"))
+  setMicIndicatorLevel(0)
+}
+
+function setMicIndicatorLevel(level) {
+  const container = document.getElementById("mic-indicator")
+  if (!container || micIndicatorBars.length === 0) return
+  const clamped = Math.max(0, Math.min(1, level))
+  micIndicatorBars.forEach((bar, idx) => {
+    const bias = 0.5 + (idx / Math.max(1, micIndicatorBars.length - 1)) * 0.6
+    const height = Math.max(6, Math.min(100, clamped * 100 * bias))
+    bar.style.height = `${height}%`
+  })
+  container.dataset.active = clamped > 0.2 ? "true" : "false"
+}
+
+function updateMicIndicatorFromRms(rms) {
+  const normalized = Math.max(0, Math.min(1, (rms - 0.005) / 0.06))
+  setMicIndicatorLevel(normalized)
+}
+
+function getSelectedVoice() {
+  const select = voiceSelect()
+  return select?.value || "alloy"
+}
 
 function append(text) {
   const pane = document.getElementById("log")
@@ -175,11 +241,12 @@ function attachRemoteAudioIfEnabled() {
 function sendAudioPreferenceUpdate() {
   if (!dc || dc.readyState !== "open") return
   const audioEnabled = isAudioEnabled()
+  const voice = audioEnabled ? getSelectedVoice() : "none"
   const sessionUpdate = {
     instructions: audioEnabled
       ? "You are a voice-enabled assistant. Provide transcripts of the user and respond aloud."
       : "You are a text-based assistant. Return only the responses to what the user asks. No audio output.",
-    voice: audioEnabled ? "alloy" : "none"
+    voice
   }
   if (audioEnabled) {
     sessionUpdate.output_audio_format = "pcm16"
@@ -228,7 +295,7 @@ function requestTranscript() {
   }
   if (audioEnabled) {
     responsePayload.response.audio = {
-      voice: "alloy",
+      voice: getSelectedVoice(),
       format: "pcm16",
       sample_rate: OUTPUT_AUDIO_SAMPLE_RATE
     }
@@ -396,6 +463,7 @@ function startAudioMonitor() {
     }
     const rms = Math.sqrt(sum / analyserBuffer.length)
     const now = performance.now()
+    updateMicIndicatorFromRms(rms)
 
     if (rms > SPEECH_THRESHOLD) {
       hasRecentSpeech = true
@@ -426,6 +494,7 @@ function stopAudioMonitor() {
   analyserBuffer = null
   hasRecentSpeech = false
   lastSpeechTs = 0
+  setMicIndicatorLevel(0)
 }
 
 async function startSession() {
@@ -574,7 +643,7 @@ async function startSession() {
       instructions: audioEnabled
         ? "You are a voice-enabled assistant. Provide transcripts of the user and respond aloud."
         : "You are a transcription service. Return only the transcript of what the user says. No audio output.",
-      voice: audioEnabled ? "alloy" : "none",
+      voice: audioEnabled ? getSelectedVoice() : "none",
       turn_detection: {
         type: "server_vad",
         threshold: 0.5,
@@ -674,6 +743,12 @@ function stopSession() {
 document.getElementById("start").onclick = startSession
 document.getElementById("stop").onclick = stopSession
 document.getElementById("enable-audio").addEventListener("change", sendAudioPreferenceUpdate)
+document.getElementById("voice-select").addEventListener("change", () => {
+  if (isAudioEnabled()) {
+    sendAudioPreferenceUpdate()
+  }
+})
+initMicIndicator()
 
 </script>
 </body>
